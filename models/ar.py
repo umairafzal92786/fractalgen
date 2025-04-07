@@ -1,15 +1,16 @@
 # Modified from:
 #   LlamaGen:    https://github.com/FoundationVision/LlamaGen/blob/main/autoregressive/models/gpt.py
+import math
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 from torch.nn import functional as F
-from util.visualize import visualize_patch
-import math
+from torch.utils.checkpoint import checkpoint
+
+# from util.visualize import visualize_patch
 
 
 def drop_path(x, drop_prob: float = 0., training: bool = False, scale_by_keep: bool = True):
@@ -439,17 +440,16 @@ class AR(nn.Module):
         # patchify to get gt
         patches = self.patchify(imgs)
         mask = torch.ones(patches.size(0), patches.size(1)).to(patches.device)
-
         # get condition for next level
         cond_list_next = self.predict(patches, cond_list)
-
         # reshape conditions and patches for next level
         for cond_idx in range(len(cond_list_next)):
             cond_list_next[cond_idx] = cond_list_next[cond_idx].reshape(cond_list_next[cond_idx].size(0) * cond_list_next[cond_idx].size(1), -1)
+            print(cond_list_next[cond_idx].shape)
 
         patches = patches.reshape(patches.size(0) * patches.size(1), -1)
         patches = patches.reshape(patches.size(0), 3, self.patch_size, self.patch_size)
-
+        print(patches.shape)
         return patches, cond_list_next, 0
 
     def sample(self, cond_list, num_iter, cfg, cfg_schedule, temperature, filter_threshold, next_level_sample_function,
@@ -488,12 +488,281 @@ class AR(nn.Module):
             cur_patches[:, step] = sampled_patches.to(cur_patches.dtype)
             patches = cur_patches.clone()
 
-            # visualize generation process for colab
-            if visualize:
-                visualize_patch(self.unpatchify(patches))
+            # # visualize generation process for colab
+            # if visualize:
+            #     visualize_patch(self.unpatchify(patches))
 
         # clean up kv cache
         for b in self.blocks:
             b.attention.kv_cache = None
         patches = self.unpatchify(patches)
         return patches
+
+class ARTimeSeries(nn.Module):
+    def __init__(self, seq_len, patch_size,input_feat_dim, cond_embed_dim, embed_dim, num_blocks, num_heads,
+                 grad_checkpointing=False, **kwargs):
+        super().__init__()
+
+        self.seq_len = seq_len
+        self.patch_size = patch_size
+        self.input_feat_dim = input_feat_dim
+
+        self.grad_checkpointing = grad_checkpointing
+
+        # --------------------------------------------------------------------------
+        # network
+        self.patch_emb = nn.Linear(input_feat_dim * patch_size, embed_dim, bias=True)
+        self.patch_emb_ln = nn.LayerNorm(embed_dim, eps=1e-6)
+        self.pos_embed_learned = nn.Parameter(torch.zeros(1, seq_len+1, embed_dim))
+        self.cond_emb = nn.Linear(cond_embed_dim, embed_dim, bias=True)
+
+        self.config = model_args = ModelArgs(dim=embed_dim, n_head=num_heads)
+        self.blocks = nn.ModuleList([TransformerBlock(config=model_args, drop_path=0.0) for _ in range(num_blocks)])
+
+        # 2d rotary pos embedding
+        grid_size = int(seq_len ** 0.5)
+        assert grid_size * grid_size == seq_len
+        self.freqs_cis = precompute_freqs_cis_2d(grid_size, model_args.dim // model_args.n_head,
+                                                 model_args.rope_base, cls_token_num=1).cuda()
+
+        # KVCache
+        self.max_batch_size = -1
+        self.max_seq_length = -1
+
+        self.norm = nn.LayerNorm(embed_dim, eps=1e-6)
+
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # parameters
+        torch.nn.init.normal_(self.pos_embed_learned, std=.02)
+
+        # initialize nn.Linear and nn.LayerNorm
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            # we use xavier_uniform following official JAX ViT:
+            torch.nn.init.xavier_uniform_(m.weight)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+            if m.weight is not None:
+                nn.init.constant_(m.weight, 1.0)
+
+    def setup_caches(self, max_batch_size, max_seq_length):
+        # if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
+        #     return
+        head_dim = self.config.dim // self.config.n_head
+        max_seq_length = find_multiple(max_seq_length, 8)
+        self.max_seq_length = max_seq_length
+        self.max_batch_size = max_batch_size
+        for b in self.blocks:
+            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_head, head_dim)
+
+        causal_mask = torch.tril(torch.ones(self.max_seq_length, self.max_seq_length, dtype=torch.bool))
+        self.causal_mask = causal_mask
+        grid_size = int(self.seq_len ** 0.5)
+        assert grid_size * grid_size == self.seq_len
+        self.freqs_cis = precompute_freqs_cis_2d(grid_size, self.config.dim // self.config.n_head,
+                                                 self.config.rope_base, 1)
+
+    def patchify(self, x):
+        #x: [B, T, F]
+        
+        bsz, total_len, feat_dim = x.shape
+        p = self.patch_size
+        assert total_len % p == 0, "Sequence length must be divisible by patch size"
+
+        num_patches = total_len // p
+        x = x.reshape(bsz, num_patches, p * feat_dim)
+        return x  # [B, num_patches, patch_dim]
+
+    def unpatchify(self, x):
+        # x: [B, num_patches, patch_dim]
+        bsz, num_patches, patch_dim = x.shape
+        p = self.patch_size
+        feat_dim = patch_dim // p
+        x = x.reshape(bsz, num_patches * p, feat_dim)
+        return x  # [B, T, F]
+
+    def predict(self, x, cond_list, input_pos=None):
+        x = self.patch_emb(x)
+        x = torch.cat([self.cond_emb(cond_list[0]).unsqueeze(1).repeat(1, 1, 1), x], dim=1)
+
+        # position embedding
+        x = x + self.pos_embed_learned[:, :x.shape[1]]
+        x = self.patch_emb_ln(x)
+
+        if input_pos is not None:
+            # use kv cache
+            freqs_cis = self.freqs_cis[input_pos]
+            mask = self.causal_mask[input_pos]
+            x = x[:, input_pos]
+        else:
+            # training
+            freqs_cis = self.freqs_cis[:x.shape[1]]
+            mask = None
+
+        # apply Transformer blocks
+        if self.grad_checkpointing and not torch.jit.is_scripting() and self.training:
+            for block in self.blocks:
+                x = checkpoint(block, x, freqs_cis, input_pos, mask)
+        else:
+            for block in self.blocks:
+                x = block(x, freqs_cis, input_pos, mask)
+        x = self.norm(x)
+
+        # return middle condition
+        if input_pos is not None:
+            middle_cond = x[:, 0]
+        else:
+            middle_cond = x[:, :-1]
+
+        return [middle_cond]
+
+    def forward(self, imgs, cond_list):
+        """ training """
+        # patchify to get gt
+        patches = self.patchify(imgs)
+        mask = torch.ones(patches.size(0), patches.size(1)).to(patches.device)
+        # get condition for next level
+        cond_list_next = self.predict(patches, cond_list)
+        # reshape conditions and patches for next level
+        for cond_idx in range(len(cond_list_next)):
+            cond_list_next[cond_idx] = cond_list_next[cond_idx].reshape(cond_list_next[cond_idx].size(0) * cond_list_next[cond_idx].size(1), -1)
+            print(cond_list_next[cond_idx].shape)
+
+        patches = patches.reshape(patches.size(0) * patches.size(1), -1)
+        # patches = patches.reshape(patches.size(0), 3, self.patch_size, self.patch_size)
+        patches = patches.reshape(-1, self.patch_size, self.input_feat_dim)  # [32, 4, 3]
+        print(patches.shape)
+        return patches, cond_list_next, 0
+
+    def sample(self, cond_list, num_iter, cfg, cfg_schedule, temperature, filter_threshold, next_level_sample_function,
+               visualize=False):
+        """ generation """
+        if cfg == 1.0:
+            bsz = cond_list[0].size(0)
+        else:
+            bsz = cond_list[0].size(0) // 2
+
+        patches = torch.zeros(bsz, self.seq_len, self.input_feat_dim * self.patch_size).cuda()
+        num_iter = self.seq_len
+
+        device = cond_list[0].device
+        with torch.device(device):
+            self.setup_caches(max_batch_size=cond_list[0].size(0), max_seq_length=num_iter)
+
+        # sample
+        for step in range(num_iter):
+            cur_patches = patches.clone()
+
+            if not cfg == 1.0:
+                patches = torch.cat([patches, patches], dim=0)
+
+            # get next level conditions
+            cond_list_next = self.predict(patches, cond_list, input_pos=torch.Tensor([step]).int())
+            # cfg schedule
+            if cfg_schedule == "linear":
+                cfg_iter = 1 + (cfg - 1) * (step + 1) / self.seq_len
+            else:
+                cfg_iter = cfg
+            sampled_patches = next_level_sample_function(cond_list=cond_list_next, cfg=cfg_iter,
+                                                         temperature=temperature, filter_threshold=filter_threshold)
+            sampled_patches = sampled_patches.reshape(sampled_patches.size(0), -1)
+
+            cur_patches[:, step] = sampled_patches.to(cur_patches.dtype)
+            patches = cur_patches.clone()
+
+            # # visualize generation process for colab
+            # if visualize:
+            #     visualize_patch(self.unpatchify(patches))
+
+        # clean up kv cache
+        for b in self.blocks:
+            b.attention.kv_cache = None
+        patches = self.unpatchify(patches)
+        return patches
+
+
+def main():
+    # torch.manual_seed(42)
+
+    # -------------------------------------
+    # Test AR model (image-based)
+    # -------------------------------------
+    print("Testing AR model on dummy image data...")
+
+    ar_model = AR(
+        seq_len=16,           # 4x4 patches
+        patch_size=4,
+        cond_embed_dim=128,
+        embed_dim=256,
+        num_blocks=4,
+        num_heads=8,
+        grad_checkpointing=False
+    ).cuda()
+
+    dummy_images = torch.randn(2, 3, 16, 16).cuda()        # [B, C, H, W]
+    dummy_cond = [torch.randn(2, 128).cuda()]              # [B, cond_dim]
+
+    patches, cond_list_next, _ = ar_model(dummy_images, dummy_cond)
+    print("AR forward output patch shape:", patches.shape)
+
+    def dummy_sample_function(cond_list, cfg, temperature, filter_threshold):
+        return torch.randn(cond_list[0].size(0), 3 * ar_model.patch_size ** 2).cuda()
+
+    with torch.no_grad():
+        sampled_imgs = ar_model.sample(
+            cond_list=dummy_cond,
+            num_iter=ar_model.seq_len,
+            cfg=1.0,
+            cfg_schedule="linear",
+            temperature=1.0,
+            filter_threshold=0.9,
+            next_level_sample_function=dummy_sample_function,
+            visualize=False
+        )
+    print("AR sample output shape:", sampled_imgs.shape)
+    # -------------------------------------
+    # Test AR model (time-series based)
+    # -------------------------------------
+    print("Testing AR model on dummy time-series data...")
+    ar_time_series_model = ARTimeSeries(
+        seq_len=16,           # 4x4 patches
+        patch_size=4,
+        input_feat_dim=3,          # new param
+        cond_embed_dim=128,
+        embed_dim=256,
+        num_blocks=4,
+        num_heads=8,
+        grad_checkpointing=False
+    ).cuda()
+    dummy_series = torch.randn(2, 64, 3).cuda()     # B, T, F
+    dummy_cond = [torch.randn(2, 128).cuda()]       # B, cond_dim
+
+    patches, cond_list_next, _ = ar_time_series_model(dummy_series, dummy_cond)
+
+    def dummy_sample_function2(cond_list, cfg, temperature, filter_threshold):
+        bsz = cond_list[0].size(0)
+        patch_dim = ar_time_series_model.input_feat_dim * ar_time_series_model.patch_size
+        return torch.randn(bsz, patch_dim).cuda()
+    print("AR forward output patch shape:", patches.shape)
+    with torch.no_grad():
+        sampled_time_series = ar_time_series_model.sample(
+            cond_list=dummy_cond,
+            num_iter=ar_time_series_model.seq_len,
+            cfg=1.0,
+            cfg_schedule="linear",
+            temperature=1.0,
+            filter_threshold=0.9,
+            next_level_sample_function=dummy_sample_function2,
+            visualize=False
+        )
+    print("ARTimeSeries sample output shape:", sampled_time_series.shape)
+
+if __name__ == "__main__":
+    main()

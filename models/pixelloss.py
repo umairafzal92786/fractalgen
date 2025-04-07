@@ -1,9 +1,8 @@
+import math
 from functools import partial
 
-import math
 import torch
 import torch.nn as nn
-
 from timm.models.vision_transformer import DropPath, Mlp
 
 
@@ -109,6 +108,201 @@ class MlmLayer(nn.Module):
         logits = torch.matmul(x, word_embeddings)
         logits = logits + self.bias
         return logits
+
+
+class TimeStepLoss(nn.Module):
+    def __init__(self, c_channels, width, depth, num_heads):
+        super().__init__()
+
+        self.cond_proj = nn.Linear(c_channels, width)
+        self.timestamp_proj = nn.Linear(1, width)
+        self.ln = nn.LayerNorm(width, eps=1e-6)
+
+        self.blocks = nn.ModuleList([
+            CausalBlock(width, num_heads=num_heads, mlp_ratio=4.0,
+                        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                        proj_drop=0, attn_drop=0)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(width, eps=1e-6)
+
+        self.out_proj = nn.Linear(width, 1)
+        self.criterion = torch.nn.MSELoss()
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # parameters
+        # torch.nn.init.normal_(self.timestamp_proj.weight, std=.02)
+        # torch.nn.init.normal_(self.cond_proj.weight, std=.02)
+
+        # initialize nn.Linear and nn.LayerNorm
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            # we use xavier_uniform following official JAX ViT:
+            torch.nn.init.xavier_uniform_(m.weight)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+            if m.weight is not None:
+                nn.init.constant_(m.weight, 1.0)
+
+    def predict(self, target, cond_list):
+        target = target.reshape(target.size(0), -1)
+        timestamps = target  # target represents timestamps in this case
+        
+        # take only the middle condition
+        cond = cond_list[0]
+        
+        # Project condition and timestamps
+        cond_proj = self.cond_proj(cond).unsqueeze(1)
+        time_proj = self.timestamp_proj(timestamps.unsqueeze(-1))
+        
+        # Concatenate projections
+        x = torch.cat([cond_proj, time_proj], dim=1)
+        x = self.ln(x)
+
+        # Pass through transformer blocks
+        for block in self.blocks:
+            x = block(x)
+        
+        x = self.norm(x)
+        
+        # Project to output dimension
+        predictions = self.out_proj(x[:, 1])  # Take the timestamp position output
+        
+        return predictions, timestamps
+
+    def forward(self, target, cond_list):
+        """Training forward pass"""
+        predictions, timestamps = self.predict(target, cond_list)
+        loss = self.criterion(predictions, timestamps)
+        return loss.mean()
+
+    def sample(self, cond_list, temperature, cfg):
+        """Generate time series predictions"""
+        if cfg == 1.0:
+            bsz = cond_list[0].size(0)
+        else:
+            bsz = cond_list[0].size(0) // 2
+
+        # Initialize with zeros
+        initial_values = torch.zeros(bsz, 1).cuda()
+        
+        if cfg == 1.0:
+            predictions, _ = self.predict(initial_values, cond_list)
+            predictions = predictions * temperature
+        else:
+            # Apply classifier-free guidance
+            preds_all, _ = self.predict(
+                torch.cat([initial_values, initial_values], dim=0), 
+                cond_list
+            )
+            preds_all = preds_all * temperature
+            
+            # Split conditional and unconditional predictions
+            cond_preds = preds_all[:bsz]
+            uncond_preds = preds_all[bsz:]
+            
+            # Apply CFG
+            predictions = uncond_preds + cfg * (cond_preds - uncond_preds)
+        
+        # Add small random noise for variation
+        predictions = predictions + temperature * torch.randn_like(predictions) * 0.1
+        
+        return predictions
+
+
+class MultiVariateTimeStepLoss(nn.Module):
+    def __init__(self, c_channels, width, depth, num_heads, num_features):
+        super().__init__()
+
+        self.cond_proj = nn.Linear(c_channels, width)
+        self.timestamp_proj = nn.Linear(num_features, width)
+        self.ln = nn.LayerNorm(width, eps=1e-6)
+
+        self.blocks = nn.ModuleList([
+            CausalBlock(width, num_heads=num_heads, mlp_ratio=4.0,
+                        qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                        proj_drop=0, attn_drop=0)
+            for _ in range(depth)
+        ])
+        self.norm = nn.LayerNorm(width, eps=1e-6)
+
+        self.out_proj = nn.Linear(width, num_features)
+        self.criterion = torch.nn.MSELoss()
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        # parameters
+        # torch.nn.init.normal_(self.timestamp_proj.weight, std=.02)
+        # torch.nn.init.normal_(self.cond_proj.weight, std=.02)
+
+        # initialize nn.Linear and nn.LayerNorm
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            # we use xavier_uniform following official JAX ViT:
+            torch.nn.init.xavier_uniform_(m.weight)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+            if m.weight is not None:
+                nn.init.constant_(m.weight, 1.0)
+
+    def predict(self, target, cond_list):
+        
+        cond = cond_list[0]  # (B, c_channels)
+        cond_proj = self.cond_proj(cond).unsqueeze(1)     # (B, 1, width)
+        time_proj = self.timestamp_proj(target).unsqueeze(1)  # (B, 1, width)
+        x = torch.cat([cond_proj, time_proj], dim=1)      # (B, 2, width)
+        x = self.ln(x)
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.norm(x)
+        predictions = self.out_proj(x[:, 1])  # predict the timestamp feature vector
+        return predictions, target
+
+    def forward(self, target, cond_list):
+        predictions, target = self.predict(target, cond_list)
+        loss = self.criterion(predictions, target)
+        return loss.mean()
+
+    def sample(self, cond_list, temperature, cfg):
+        if cfg == 1.0:
+            bsz = cond_list[0].size(0)
+        else:
+            bsz = cond_list[0].size(0) // 2
+
+        # Initialize with zeros for each feature
+        initial_values = torch.zeros(bsz, self.timestamp_proj.in_features).cuda()
+
+        if cfg == 1.0:
+            predictions, _ = self.predict(initial_values, cond_list)
+            predictions = predictions * temperature
+        else:
+            # Classifier-Free Guidance
+            preds_all, _ = self.predict(
+                torch.cat([initial_values, initial_values], dim=0),
+                cond_list
+            )
+            preds_all = preds_all * temperature
+            cond_preds = preds_all[:bsz]
+            uncond_preds = preds_all[bsz:]
+            predictions = uncond_preds + cfg * (cond_preds - uncond_preds)
+
+        # Add small Gaussian noise for diversity
+        predictions = predictions + temperature * torch.randn_like(predictions) * 0.1
+
+        return predictions
 
 
 class PixelLoss(nn.Module):
@@ -242,3 +436,103 @@ class PixelLoss(nn.Module):
 
         # back to [0, 1]
         return pixel_values
+
+def main_pixelloss():
+    batch_size = 8
+    c_channels = 16
+    width = 64
+    depth = 2
+    num_heads = 4
+
+    model = PixelLoss(
+        c_channels=c_channels,
+        width=width,
+        depth=depth,
+        num_heads=num_heads,
+        r_weight=1.0
+    ).cuda()
+
+    target = torch.rand(batch_size, 3).cuda()  # normalized RGB values
+    cond_vector = torch.rand(batch_size, c_channels).cuda()
+    cond_list = [cond_vector]
+
+    model.train()
+    loss = model(target, cond_list)
+    print(f"[PixelLoss] Training loss: {loss.item()}")
+
+    model.eval()
+    with torch.no_grad():
+        eval_loss = model(target, cond_list)
+        print(f"[PixelLoss] Evaluation loss: {eval_loss.item()}")
+
+        samples = model.sample(cond_list, temperature=1.0, cfg=1.0)
+        print(f"[PixelLoss] Sampled RGB pixels:\n{samples}")
+
+def main_timestep_loss():
+    batch_size = 8
+    c_channels = 16
+    width = 64
+    depth = 2
+    num_heads = 4
+
+    model = TimeStepLoss(
+        c_channels=c_channels,
+        width=width,
+        depth=depth,
+        num_heads=num_heads
+    ).cuda()
+
+    target = torch.rand(batch_size, 1).cuda()  # scalar timestamps
+    cond_vector = torch.rand(batch_size, c_channels).cuda()
+    cond_list = [cond_vector]
+
+    model.train()
+    loss = model(target, cond_list)
+    print(f"[TimeStepLoss] Training loss: {loss.item()}")
+
+    model.eval()
+    with torch.no_grad():
+        eval_loss = model(target, cond_list)
+        print(f"[TimeStepLoss] Evaluation loss: {eval_loss.item()}")
+
+        samples = model.sample(cond_list, temperature=1.0, cfg=1.0)
+        print(f"[TimeStepLoss] Sampled timestamps:\n{samples}")
+
+
+def main_multivariate_timestep_loss():
+    batch_size = 8
+    c_channels = 16
+    num_features = 5
+    width = 64
+    depth = 2
+    num_heads = 4
+
+    model = MultiVariateTimeStepLoss(
+        c_channels=c_channels,
+        width=width,
+        depth=depth,
+        num_heads=num_heads,
+        num_features=num_features
+    ).cuda()
+
+    target = torch.rand(batch_size, num_features).cuda()
+    cond_vector = torch.rand(batch_size, c_channels).cuda()
+    cond_list = [cond_vector]
+
+    model.train()
+    loss = model(target, cond_list)
+    print(f"[MultiVariateTimeStepLoss] Training loss: {loss.item()}")
+
+    model.eval()
+    with torch.no_grad():
+        eval_loss = model(target, cond_list)
+        print(f"[MultiVariateTimeStepLoss] Evaluation loss: {eval_loss.item()}")
+
+        samples = model.sample(cond_list, temperature=1.0, cfg=1.0)
+        print(f"[MultiVariateTimeStepLoss] Sampled multivariate timestamps:\n{samples}")
+
+
+if __name__ == "__main__":
+    main_multivariate_timestep_loss()
+    main_pixelloss()
+    main_timestep_loss()
