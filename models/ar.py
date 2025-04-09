@@ -445,11 +445,11 @@ class AR(nn.Module):
         # reshape conditions and patches for next level
         for cond_idx in range(len(cond_list_next)):
             cond_list_next[cond_idx] = cond_list_next[cond_idx].reshape(cond_list_next[cond_idx].size(0) * cond_list_next[cond_idx].size(1), -1)
-            print(cond_list_next[cond_idx].shape)
+            # print(cond_list_next[cond_idx].shape)
 
         patches = patches.reshape(patches.size(0) * patches.size(1), -1)
         patches = patches.reshape(patches.size(0), 3, self.patch_size, self.patch_size)
-        print(patches.shape)
+        # print(patches.shape)
         return patches, cond_list_next, 0
 
     def sample(self, cond_list, num_iter, cfg, cfg_schedule, temperature, filter_threshold, next_level_sample_function,
@@ -520,10 +520,14 @@ class ARTimeSeries(nn.Module):
         self.blocks = nn.ModuleList([TransformerBlock(config=model_args, drop_path=0.0) for _ in range(num_blocks)])
 
         # 2d rotary pos embedding
-        grid_size = int(seq_len ** 0.5)
-        assert grid_size * grid_size == seq_len
-        self.freqs_cis = precompute_freqs_cis_2d(grid_size, model_args.dim // model_args.n_head,
-                                                 model_args.rope_base, cls_token_num=1).cuda()
+        # print("Here", seq_len)
+        # grid_size = int(seq_len ** 0.5)
+        # print(grid_size)
+        # assert grid_size * grid_size == seq_len
+        # self.freqs_cis = precompute_freqs_cis_2d(grid_size, model_args.dim // model_args.n_head,
+        #                                          model_args.rope_base, cls_token_num=1).cuda()
+        #1D embeddings
+        self.freqs_cis = precompute_freqs_cis(seq_len, model_args.dim // model_args.n_head,model_args.rope_base, cls_token_num=1).cuda()
 
         # KVCache
         self.max_batch_size = -1
@@ -626,19 +630,24 @@ class ARTimeSeries(nn.Module):
     def forward(self, imgs, cond_list):
         """ training """
         # patchify to get gt
+        # print("enter forward")	
         patches = self.patchify(imgs)
         mask = torch.ones(patches.size(0), patches.size(1)).to(patches.device)
         # get condition for next level
         cond_list_next = self.predict(patches, cond_list)
+        # print("cond_list_size", len(cond_list_next))
+        # print("cond_list_next shape", cond_list_next[0].shape)
         # reshape conditions and patches for next level
         for cond_idx in range(len(cond_list_next)):
             cond_list_next[cond_idx] = cond_list_next[cond_idx].reshape(cond_list_next[cond_idx].size(0) * cond_list_next[cond_idx].size(1), -1)
-            print(cond_list_next[cond_idx].shape)
+            # print("cond list reshaped", cond_list_next[cond_idx].shape)
 
         patches = patches.reshape(patches.size(0) * patches.size(1), -1)
+        # print(patches.shape)
         # patches = patches.reshape(patches.size(0), 3, self.patch_size, self.patch_size)
         patches = patches.reshape(-1, self.patch_size, self.input_feat_dim)  # [32, 4, 3]
-        print(patches.shape)
+        # print(patches.shape)
+        # print("exit forward")
         return patches, cond_list_next, 0
 
     def sample(self, cond_list, num_iter, cfg, cfg_schedule, temperature, filter_threshold, next_level_sample_function,
@@ -707,7 +716,7 @@ def main():
     ).cuda()
 
     dummy_images = torch.randn(2, 3, 16, 16).cuda()        # [B, C, H, W]
-    dummy_cond = [torch.randn(2, 128).cuda()]              # [B, cond_dim]
+    dummy_cond = [torch.randn(2, 128).cuda(), torch.randn(2, 128).cuda()]              # [B, cond_dim]
 
     patches, cond_list_next, _ = ar_model(dummy_images, dummy_cond)
     print("AR forward output patch shape:", patches.shape)
@@ -734,23 +743,23 @@ def main():
     ar_time_series_model = ARTimeSeries(
         seq_len=16,           # 4x4 patches
         patch_size=4,
-        input_feat_dim=3,          # new param
-        cond_embed_dim=128,
-        embed_dim=256,
-        num_blocks=4,
-        num_heads=8,
+        input_feat_dim=6,          # new param
+        cond_embed_dim=1024,
+        embed_dim=1024,
+        num_blocks=32,
+        num_heads=16,
         grad_checkpointing=False
     ).cuda()
-    dummy_series = torch.randn(2, 64, 3).cuda()     # B, T, F
-    dummy_cond = [torch.randn(2, 128).cuda()]       # B, cond_dim
+    dummy_series = torch.randn(4, 64, 6).cuda()     # B, T, F
+    dummy_cond = [torch.randn(4, 1024).cuda(), torch.randn(4, 1024).cuda()]       # B, cond_dim
 
     patches, cond_list_next, _ = ar_time_series_model(dummy_series, dummy_cond)
+    print("AR forward output patch shape:", patches.shape)
 
     def dummy_sample_function2(cond_list, cfg, temperature, filter_threshold):
         bsz = cond_list[0].size(0)
         patch_dim = ar_time_series_model.input_feat_dim * ar_time_series_model.patch_size
         return torch.randn(bsz, patch_dim).cuda()
-    print("AR forward output patch shape:", patches.shape)
     with torch.no_grad():
         sampled_time_series = ar_time_series_model.sample(
             cond_list=dummy_cond,

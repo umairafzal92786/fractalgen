@@ -3,18 +3,17 @@ from functools import partial
 import torch
 import torch.nn as nn
 
-from models.ar import AR, ARTimeSeries
-from models.mar import MAR
+from models.ar import ARTimeSeries
 from models.pixelloss import MultiVariateTimeStepLoss  # whichever fits best
-from models.pixelloss import PixelLoss, TimeStepLoss
 
 
-class FractalGen(nn.Module):
+class FractalGenTimeSeries(nn.Module):
     """Fractal Generative Model"""
 
     def __init__(
         self,
-        img_size_list,
+        series_size_list,
+        input_feat_dim,
         embed_dim_list,
         num_blocks_list,
         num_heads_list,
@@ -25,7 +24,6 @@ class FractalGen(nn.Module):
         proj_dropout=0.1,
         guiding_pixel=False,
         num_conds=1,
-        r_weight=1.0,
         grad_checkpointing=False,
         fractal_level=0,
     ):
@@ -34,7 +32,7 @@ class FractalGen(nn.Module):
         # --------------------------------------------------------------------------
         # fractal specifics
         self.fractal_level = fractal_level
-        self.num_fractal_levels = len(img_size_list)
+        self.num_fractal_levels = len(series_size_list)
 
         # --------------------------------------------------------------------------
         # Class embedding for the first fractal level
@@ -49,15 +47,15 @@ class FractalGen(nn.Module):
         # --------------------------------------------------------------------------
         # Generator for the current level
         if generator_type_list[fractal_level] == "ar":
-            generator = AR
-        elif generator_type_list[fractal_level] == "mar":
-            generator = MAR
+            generator = ARTimeSeries
+        # elif generator_type_list[fractal_level] == "mar":
+        #     generator = MAR
         else:
             raise NotImplementedError
         self.generator = generator(
-            seq_len=(img_size_list[fractal_level] // img_size_list[fractal_level + 1])
-            ** 2,
-            patch_size=img_size_list[fractal_level + 1],
+            seq_len=(series_size_list[fractal_level] // series_size_list[fractal_level + 1]),
+            patch_size=series_size_list[fractal_level + 1],
+            input_feat_dim=input_feat_dim,       
             cond_embed_dim=(
                 embed_dim_list[fractal_level - 1]
                 if fractal_level > 0
@@ -76,8 +74,9 @@ class FractalGen(nn.Module):
         # --------------------------------------------------------------------------
         # Build the next fractal level recursively
         if self.fractal_level < self.num_fractal_levels - 2:
-            self.next_fractal = FractalGen(
-                img_size_list=img_size_list,
+            self.next_fractal = FractalGenTimeSeries(
+                series_size_list=series_size_list,
+                input_feat_dim=input_feat_dim,
                 embed_dim_list=embed_dim_list,
                 num_blocks_list=num_blocks_list,
                 num_heads_list=num_heads_list,
@@ -88,24 +87,32 @@ class FractalGen(nn.Module):
                 proj_dropout=proj_dropout,
                 guiding_pixel=guiding_pixel,
                 num_conds=num_conds,
-                r_weight=r_weight,
                 grad_checkpointing=grad_checkpointing,
                 fractal_level=fractal_level + 1,
             )
         else:
             # The final fractal level uses PixelLoss.
-            self.next_fractal = PixelLoss(
+            self.next_fractal = MultiVariateTimeStepLoss(
                 c_channels=embed_dim_list[fractal_level],
                 depth=num_blocks_list[fractal_level + 1],
                 width=embed_dim_list[fractal_level + 1],
                 num_heads=num_heads_list[fractal_level + 1],
-                r_weight=r_weight,
+                num_features=input_feat_dim,
             )
+            #print each argument of MultiVariateTimeStepLoss class
+            # print("c_channels: ", embed_dim_list[fractal_level])
+            # print("depth: ", num_blocks_list[fractal_level + 1])
+            # print("width: ", embed_dim_list[fractal_level + 1])
+            # print("num_heads: ", num_heads_list[fractal_level + 1])
+            # print("num_features: ", input_feat_dim)
 
     def forward(self, imgs, cond_list):
         """
         Forward pass to get loss recursively.
         """
+
+        # print("Fractal level: ", self.fractal_level)
+        # print("Input shape: ", imgs.shape)
         if self.fractal_level == 0:
             # Compute class embedding conditions.
             class_embedding = self.class_emb(cond_list)
@@ -133,10 +140,18 @@ class FractalGen(nn.Module):
                     drop_latent_mask * self.fake_latent
                     + (1 - drop_latent_mask) * class_embedding
                 )
-            cond_list = [class_embedding for _ in range(5)]
+            # cond_list = [class_embedding for _ in range(5)]
+            cond_list = [class_embedding]
+
+        # print('here')
+        # for item in cond_list:
+        #     print("Condition shape: ", item.shape)
+
+        # exit()
 
         # Get image patches and conditions for the next level
         imgs, cond_list, guiding_pixel_loss = self.generator(imgs, cond_list)
+        # print("output shape: ", imgs.shape)
         # Compute loss recursively from the next fractal level.
         loss = self.next_fractal(imgs, cond_list)
         return loss + guiding_pixel_loss
@@ -177,64 +192,17 @@ class FractalGen(nn.Module):
             visualize,
         )
 
-def fractalar_in64(**kwargs):
-    model = FractalGen(
-        img_size_list=(64, 4, 1),
+
+
+
+def fractaltimeseriesar_in64(**kwargs):
+    model = FractalGenTimeSeries(
+        series_size_list=(1024, 4, 1),
+        input_feat_dim=6,
         embed_dim_list=(1024, 512, 128),
         num_blocks_list=(32, 8, 3),
         num_heads_list=(16, 8, 4),
         generator_type_list=("ar", "ar", "ar"),
-        fractal_level=0,
-        **kwargs
-    )
-    return model
-
-def fractalmar_in64(**kwargs):
-    model = FractalGen(
-        img_size_list=(64, 4, 1),
-        embed_dim_list=(1024, 512, 128),
-        num_blocks_list=(32, 8, 3),
-        num_heads_list=(16, 8, 4),
-        generator_type_list=("mar", "mar", "ar"),
-        fractal_level=0,
-        **kwargs
-    )
-    return model
-
-
-def fractalmar_base_in256(**kwargs):
-    model = FractalGen(
-        img_size_list=(256, 16, 4, 1),
-        embed_dim_list=(768, 384, 192, 64),
-        num_blocks_list=(24, 6, 3, 1),
-        num_heads_list=(12, 6, 3, 4),
-        generator_type_list=("mar", "mar", "mar", "ar"),
-        fractal_level=0,
-        **kwargs
-    )
-    return model
-
-
-def fractalmar_large_in256(**kwargs):
-    model = FractalGen(
-        img_size_list=(256, 16, 4, 1),
-        embed_dim_list=(1024, 512, 256, 64),
-        num_blocks_list=(32, 8, 4, 1),
-        num_heads_list=(16, 8, 4, 4),
-        generator_type_list=("mar", "mar", "mar", "ar"),
-        fractal_level=0,
-        **kwargs
-    )
-    return model
-
-
-def fractalmar_huge_in256(**kwargs):
-    model = FractalGen(
-        img_size_list=(256, 16, 4, 1),
-        embed_dim_list=(1280, 640, 320, 64),
-        num_blocks_list=(40, 10, 5, 1),
-        num_heads_list=(16, 8, 4, 4),
-        generator_type_list=("mar", "mar", "mar", "ar"),
         fractal_level=0,
         **kwargs
     )

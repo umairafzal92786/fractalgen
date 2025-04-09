@@ -272,6 +272,16 @@ class MultiVariateTimeStepLoss(nn.Module):
         return predictions, target
 
     def forward(self, target, cond_list):
+        # print("target shape", target.shape)
+        # print("cond_list size", len(cond_list))
+        # print("cond_list[0] shape", cond_list[0].shape)
+        if target.ndim == 3 and target.size(1) == 1:
+            target = target.squeeze(1)
+        # print("entered loss forward")
+        # print("target shape", target.shape)
+        # print("cond_list size", len(cond_list))
+        # print("cond_list[0] shape", cond_list[0].shape)
+
         predictions, target = self.predict(target, cond_list)
         loss = self.criterion(predictions, target)
         return loss.mean()
@@ -500,11 +510,11 @@ def main_timestep_loss():
 
 
 def main_multivariate_timestep_loss():
-    batch_size = 8
-    c_channels = 16
-    num_features = 5
-    width = 64
-    depth = 2
+    batch_size = 4
+    c_channels = 512
+    num_features = 6
+    width = 128
+    depth = 3
     num_heads = 4
 
     model = MultiVariateTimeStepLoss(
@@ -515,7 +525,7 @@ def main_multivariate_timestep_loss():
         num_features=num_features
     ).cuda()
 
-    target = torch.rand(batch_size, num_features).cuda()
+    target = torch.rand(batch_size,1, num_features).cuda()
     cond_vector = torch.rand(batch_size, c_channels).cuda()
     cond_list = [cond_vector]
 
@@ -534,5 +544,5 @@ def main_multivariate_timestep_loss():
 
 if __name__ == "__main__":
     main_multivariate_timestep_loss()
-    main_pixelloss()
-    main_timestep_loss()
+    # main_pixelloss()
+    # main_timestep_loss()

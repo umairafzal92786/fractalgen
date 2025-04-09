@@ -5,24 +5,71 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.backends.cudnn as cudnn
-import torchvision.datasets as datasets
-import torchvision.transforms as transforms
+import torch.utils
+import torch.utils.data
+from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 
 import util.misc as misc
-from engine_fractalgen import compute_nll, evaluate, train_one_epoch
-from models import fractalgen
-from util.crop import center_crop_arr
+from engine_fractalgenseries import compute_nll, evaluate, train_one_epoch
+from models import fractalgentimeseries
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
+
+
+class StockCSVFolderDataset(Dataset):
+    def __init__(self, root_dir, series_len, normalize=True):
+        self.series_len = series_len
+        self.normalize = normalize
+        self.samples = []
+
+        for fname in os.listdir(root_dir):
+            if fname.endswith(".csv"):
+                csv_path = os.path.join(root_dir, fname)
+                label = os.path.splitext(fname)[0]
+                self.samples.append((csv_path, label))
+
+        labels = sorted(set(label for _, label in self.samples))
+        self.label_to_idx = {label: idx for idx, label in enumerate(labels)}
+        self.idx_to_label = {idx: label for label, idx in self.label_to_idx.items()}
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        csv_path, label = self.samples[idx]
+        df = pd.read_csv(csv_path)
+        df = df.drop(columns=['Ticker', 'Date'], errors='ignore')
+        df = df.apply(pd.to_numeric, errors='coerce').fillna(0.0)
+
+        series = df.values
+
+        if series.shape[0] < self.series_len:
+            pad_len = self.series_len - series.shape[0]
+            pad = np.zeros((pad_len, series.shape[1]))
+            series = np.vstack([series, pad])
+        else:
+            series = series[:self.series_len, :]
+
+        if self.normalize:
+            # Normalize each feature (column-wise standardization)
+            mean = series.mean(axis=0, keepdims=True)
+            std = series.std(axis=0, keepdims=True) + 1e-6  # avoid divide by zero
+            series = (series - mean) / std
+
+        series_tensor = torch.tensor(series, dtype=torch.float32)
+        label_idx = self.label_to_idx[label]
+        return series_tensor, label_idx
+
 
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Fractal Generative Models', add_help=False)
-    parser.add_argument('--batch_size', default=64, type=int,
+    parser.add_argument('--batch_size', default=16, type=int,
                         help='Batch size per GPU (effective batch size = batch_size * # GPUs)')
-    parser.add_argument('--epochs', default=400, type=int)
+    parser.add_argument('--epochs', default=1, type=int)
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--resume', default='',
                         help='Folder that contains checkpoint to resume from')
@@ -35,15 +82,15 @@ def get_args_parser():
     parser.set_defaults(pin_mem=True)
 
     # Model parameters
-    parser.add_argument('--model', default='fractalmar_in64', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='fractaltimeseriesar_in64', type=str, metavar='MODEL',
                         help='Name of the model to train')
-    parser.add_argument('--img_size', default=64, type=int, help='Image size')
+    parser.add_argument('--series_len', default=1024, type=int, help='series length')
 
     # Generation parameters
     parser.add_argument('--num_iter_list', default='64,16', type=str,
                         help='Number of autoregressive iterations for each fractal level')
-    parser.add_argument('--num_images', default=50000, type=int,
-                        help='Number of images to generate')
+    parser.add_argument('--num_series', default=10, type=int,
+                        help='Number of series to generate')
     parser.add_argument('--cfg', default=1.0, type=float,
                         help='Classifier-free guidance factor')
     parser.add_argument('--cfg_schedule', default='linear', type=str)
@@ -59,9 +106,9 @@ def get_args_parser():
     parser.add_argument('--online_eval', action='store_true')
     parser.add_argument('--evaluate_gen', action='store_true')
     parser.add_argument('--evaluate_nll', action='store_true')
-    parser.add_argument('--gen_bsz', type=int, default=1024,
+    parser.add_argument('--gen_bsz', type=int, default=1,
                         help='Generation batch size')
-    parser.add_argument('--nll_bsz', type=int, default=128,
+    parser.add_argument('--nll_bsz', type=int, default=1,
                         help='NLL evaluation batch size')
     parser.add_argument('--nll_forward_number', type=int, default=1,
                         help='Number of forward passes used to evaluate the NLL for each data sample. '
@@ -88,8 +135,6 @@ def get_args_parser():
                         help='Use guiding pixels')
     parser.add_argument('--num_conds', type=int, default=1,
                         help='Number of conditions to use')
-    parser.add_argument('--r_weight', type=float, default=5.0,
-                        help='Loss weight on the red channel')
     parser.add_argument('--grad_clip', type=float, default=3.0,
                         help='Gradient clipping value')
     parser.add_argument('--attn_dropout', type=float, default=0.1,
@@ -98,9 +143,9 @@ def get_args_parser():
                         help='Projection dropout rate')
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='./data/imagenet', type=str,
+    parser.add_argument('--data_path', default='./raw_data', type=str,
                         help='Path to the dataset')
-    parser.add_argument('--class_num', default=1000, type=int)
+    parser.add_argument('--class_num', default=483, type=int)
     parser.add_argument('--output_dir', default='./output_dir',
                         help='Directory to save outputs (empty for no saving)')
     parser.add_argument('--device', default='cuda',
@@ -142,20 +187,28 @@ def main(args):
         log_writer = None
 
     # Data augmentation transforms (following DiT and ADM)
-    transform_train = transforms.Compose([
-        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.img_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
-    transform_val = transforms.Compose([
-        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
+    # transform_train = transforms.Compose([
+    #     transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.img_size)),
+    #     transforms.RandomHorizontalFlip(),
+    #     transforms.ToTensor(),
+    #     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    # ])
+    # transform_val = transforms.Compose([
+    #     transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.img_size)),
+    #     transforms.ToTensor(),
+    #     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    # ])
 
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    dataset_val = datasets.ImageFolder(os.path.join(args.data_path, 'val'), transform=transform_val)
+
+
+    dataset_train = StockCSVFolderDataset(os.path.join(args.data_path, 'train'), series_len=args.series_len, normalize=True)
+    dataset_val = StockCSVFolderDataset(os.path.join(args.data_path, 'val'), series_len=args.series_len, normalize=True)
+    
+    # sample = dataset_train[0]
+    # print("Sample shape:", sample[0].shape)
+    # print("Sample label:", dataset_train.idx_to_label[sample[1]])
+    # print("Dataset length:", len(dataset_train))
+
 
     sampler_train = torch.utils.data.DistributedSampler(
         dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
@@ -169,6 +222,12 @@ def main(args):
         pin_memory=args.pin_mem,
         drop_last=True,
     )
+
+    #check shape of data_loader_train
+    # sample = next(iter(data_loader_train))
+    # print(len(sample[0]))
+    # print("Sample shape:", sample[0].shape)
+    
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val, shuffle=True,
         batch_size=args.nll_bsz,
@@ -178,14 +237,13 @@ def main(args):
     )
 
     # Create fractal generative model
-    model = fractalgen.__dict__[args.model](
+    model = fractalgentimeseries.__dict__[args.model](
         label_drop_prob=args.label_drop_prob,
         class_num=args.class_num,
         attn_dropout=args.attn_dropout,
         proj_dropout=args.proj_dropout,
         guiding_pixel=args.guiding_pixel,
         num_conds=args.num_conds,
-        r_weight=args.r_weight,
         grad_checkpointing=args.grad_checkpointing
     )
 
@@ -203,8 +261,10 @@ def main(args):
     print("Actual lr: {:.2e}".format(args.lr))
     print("Effective batch size: %d" % eff_batch_size)
 
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-    model_without_ddp = model.module
+    # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[0])
+    model.to(device)
+    # model_without_ddp = model.module
+    model_without_ddp = model
 
     # Set up optimizer with weight decay adjustment for bias and norm layers
     param_groups = misc.add_weight_decay(model_without_ddp, args.weight_decay)

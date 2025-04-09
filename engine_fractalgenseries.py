@@ -35,11 +35,17 @@ def train_one_epoch(model, data_loader: Iterable, optimizer: torch.optim.Optimiz
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
+        # print("samples shape: ", samples.shape)
+        # print("labels shape: ", labels.shape)
+
         # forward
         with torch.cuda.amp.autocast():
             loss = model(samples, labels)
 
         loss_value = loss.item()
+
+        # print("loss: ", loss_value)
+        # exit()
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
             sys.exit(1)
@@ -104,14 +110,14 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     model_without_ddp.eval()
     world_size = misc.get_world_size()
     local_rank = misc.get_rank()
-    num_steps = args.num_images // (batch_size * world_size) + 1
+    num_steps = args.num_series // (batch_size * world_size) + 1
 
-    # Construct the folder name for saving generated images.
+    # Construct the folder name for saving generated series.
     save_folder = os.path.join(
         args.output_dir,
-        "ariter{}-temp{}-{}cfg{}-filter{}-image{}".format(
+        "ariter{}-temp{}-{}cfg{}-filter{}-series{}".format(
             args.num_iter_list, args.temperature, args.cfg_schedule,
-            args.cfg, args.filter_threshold, args.num_images
+            args.cfg, args.filter_threshold, args.num_series
         )
     )
     if args.evaluate_gen:
@@ -120,10 +126,10 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     if misc.get_rank() == 0 and not os.path.exists(save_folder):
         os.makedirs(save_folder)
 
-    # Ensure that the number of images per class is equal.
+    # Ensure that the number of series per class is equal.
     class_num = args.class_num
-    assert args.num_images % class_num == 0, "Number of images per class must be the same"
-    class_label_gen_world = np.arange(0, class_num).repeat(args.num_images // class_num)
+    assert args.num_series % class_num == 0, "Number of series per class must be the same"
+    class_label_gen_world = np.arange(0, class_num).repeat(args.num_series // class_num)
     class_label_gen_world = np.hstack([class_label_gen_world, np.zeros(50000)])
 
     used_time = 0.0
@@ -150,7 +156,7 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
                         [class_embedding, model_without_ddp.fake_latent.repeat(batch_size, 1)],
                         dim=0
                     )
-                sampled_images = model_without_ddp.sample(
+                sampled_series = model_without_ddp.sample(
                     cond_list=[class_embedding for _ in range(args.num_conds)],
                     num_iter_list=[int(num_iter) for num_iter in args.num_iter_list.split(",")],
                     cfg=args.cfg, cfg_schedule=args.cfg_schedule,
@@ -165,22 +171,18 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
         if i >= 1:
             used_time += batch_time
             gen_img_cnt += batch_size
-            print("Generating {} images takes {:.5f} seconds, {:.5f} sec per image".format(gen_img_cnt, used_time, used_time / gen_img_cnt))
+            print("Generating {} series takes {:.5f} seconds, {:.5f} sec per series".format(gen_img_cnt, used_time, used_time / gen_img_cnt))
 
         torch.distributed.barrier()
 
-        # Denormalize images.
-        pix_mean = torch.Tensor([0.485, 0.456, 0.406]).cuda().view(1, -1, 1, 1)
-        pix_std = torch.Tensor([0.229, 0.224, 0.225]).cuda().view(1, -1, 1, 1)
-        sampled_images = sampled_images * pix_std + pix_mean
-        sampled_images = sampled_images.detach().cpu()
+        sampled_series = sampled_series.detach().cpu()
 
-        # distributed save images
-        for b_id in range(sampled_images.size(0)):
-            img_id = i * sampled_images.size(0) * world_size + local_rank * sampled_images.size(0) + b_id
-            if img_id >= args.num_images:
+        # distributed save series
+        for b_id in range(sampled_series.size(0)):
+            img_id = i * sampled_series.size(0) * world_size + local_rank * sampled_series.size(0) + b_id
+            if img_id >= args.num_series:
                 break
-            gen_img = np.round(np.clip(sampled_images[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
+            gen_img = np.round(np.clip(sampled_series[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
             cv2.imwrite(os.path.join(save_folder, '{}.png'.format(str(img_id).zfill(5))), gen_img)
 
