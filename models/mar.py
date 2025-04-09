@@ -1,15 +1,15 @@
+import math
 from functools import partial
 
-import math
 import numpy as np
 import scipy.stats as stats
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
-from util.visualize import visualize_patch
-
 from timm.models.vision_transformer import DropPath, Mlp
+from torch.utils.checkpoint import checkpoint
+
 from models.pixelloss import PixelLoss
+from util.visualize import visualize_patch
 
 
 def mask_by_order(mask_len, order, bsz, seq_len):
@@ -340,3 +340,166 @@ class MAR(nn.Module):
 
         patches = self.unpatchify(patches)
         return patches
+
+
+class MARTimeSeries(nn.Module):
+    def __init__(self, seq_len, patch_size, input_feat_dim, cond_embed_dim, embed_dim, num_blocks, num_heads,
+                 attn_dropout, proj_dropout, num_conds=1, grad_checkpointing=False):
+        super().__init__()
+
+        self.seq_len = seq_len
+        self.patch_size = patch_size
+        self.num_conds = num_conds
+        self.grad_checkpointing = grad_checkpointing
+        self.input_feat_dim = input_feat_dim
+
+        self.mask_ratio_generator = stats.truncnorm(-4, 0, loc=1.0, scale=0.25)
+
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.patch_emb = nn.Linear(input_feat_dim * patch_size, embed_dim, bias=True)
+        self.patch_emb_ln = nn.LayerNorm(embed_dim, eps=1e-6)
+        self.cond_emb = nn.Linear(cond_embed_dim, embed_dim, bias=True)
+        self.pos_embed_learned = nn.Parameter(torch.zeros(1, seq_len + num_conds, embed_dim))
+
+        self.blocks = nn.ModuleList([
+            Block(embed_dim, num_heads, mlp_ratio=4., qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
+                  proj_drop=proj_dropout, attn_drop=attn_dropout)
+            for _ in range(num_blocks)
+        ])
+        self.norm = nn.LayerNorm(embed_dim, eps=1e-6)
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        torch.nn.init.normal_(self.mask_token, std=.02)
+        torch.nn.init.normal_(self.pos_embed_learned, std=.02)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def patchify(self, x):
+        #x: [B, T, F]
+        
+        bsz, total_len, feat_dim = x.shape
+        p = self.patch_size
+        assert total_len % p == 0, "Sequence length must be divisible by patch size"
+
+        num_patches = total_len // p
+        x = x.reshape(bsz, num_patches, p * feat_dim)
+        return x  # [B, num_patches, patch_dim]
+
+    def unpatchify(self, x):
+        # x: [B, num_patches, patch_dim]
+        bsz, num_patches, patch_dim = x.shape
+        p = self.patch_size
+        feat_dim = patch_dim // p
+        x = x.reshape(bsz, num_patches * p, feat_dim)
+        return x  # [B, T, F]
+
+    def sample_orders(self, bsz):
+        return torch.argsort(torch.rand(bsz, self.seq_len).cuda(), dim=1).long()
+
+    def random_masking(self, x, orders):
+        bsz, seq_len, _ = x.shape
+        mask_rates = self.mask_ratio_generator.rvs(bsz)
+        num_masked_tokens = torch.tensor(np.ceil(seq_len * mask_rates), device=x.device).long()
+        expanded_indices = torch.arange(seq_len, device=x.device).expand(bsz, seq_len)
+        sorted_orders = torch.argsort(orders, dim=-1)
+        mask = (expanded_indices < num_masked_tokens.unsqueeze(1)).float()
+        mask = torch.scatter(torch.zeros_like(mask), dim=-1, index=sorted_orders, src=mask)
+        return mask
+
+    def random_masking_uniform(self, x, orders):
+        bsz, seq_len, _ = x.shape
+        num_masked_tokens = np.random.randint(seq_len) + 1
+        mask = torch.zeros(bsz, seq_len, device=x.device)
+        mask = torch.scatter(mask, dim=-1, index=orders[:, :num_masked_tokens],
+                             src=torch.ones(bsz, seq_len, device=x.device))
+        return mask
+
+    def predict(self, x, mask, cond_list):
+        x = self.patch_emb(x)
+        for i in range(self.num_conds):
+            x = torch.cat([self.cond_emb(cond_list[i]).unsqueeze(1), x], dim=1)
+
+        mask_with_cond = torch.cat([
+            torch.zeros(x.size(0), self.num_conds, device=x.device), mask
+        ], dim=1).bool()
+        x = torch.where(mask_with_cond.unsqueeze(-1), self.mask_token.to(x.dtype), x)
+        x = x + self.pos_embed_learned[:, :x.shape[1]]
+        x = self.patch_emb_ln(x)
+
+        for block in self.blocks:
+            x = block(x)
+        x = self.norm(x)
+        cond_out = x[:, self.num_conds:]  # remove cond tokens
+        return [cond_out]
+
+    def forward(self, x, cond_list):
+        patches = self.patchify(x)
+        orders = self.sample_orders(patches.size(0))
+        mask = self.random_masking(patches, orders) if self.training else self.random_masking_uniform(patches, orders)
+        cond_list_next = self.predict(patches, mask, cond_list)
+        for cond_idx in range(len(cond_list_next)):
+            cond_list_next[cond_idx] = cond_list_next[cond_idx].reshape(cond_list_next[cond_idx].size(0) * cond_list_next[cond_idx].size(1), -1)
+            cond_list_next[cond_idx] = cond_list_next[cond_idx][mask.reshape(-1).bool()]
+
+        patches = patches.reshape(patches.size(0) * patches.size(1), -1)
+        patches = patches[mask.reshape(-1).bool()]
+        patches = patches.reshape(-1, self.patch_size, self.input_feat_dim)  # [N, P, F]
+        return patches, cond_list_next, 0
+
+    def sample(self, cond_list, num_iter, cfg, cfg_schedule, temperature, filter_threshold, next_level_sample_function,
+               visualize=False):
+        if cfg == 1.0:
+            bsz = cond_list[0].size(0)
+        else:
+            bsz = cond_list[0].size(0) // 2
+
+
+        patches = torch.zeros(bsz, self.seq_len, self.patch_size * cond_list[0].size(-1) // self.num_conds).cuda()
+        mask = torch.ones(bsz, self.seq_len).cuda()
+        orders = self.sample_orders(bsz)
+        num_iter = min(self.seq_len, num_iter)
+
+        for step in range(num_iter):
+            cur_patches = patches.clone()
+            if cfg != 1.0:
+                patches = torch.cat([patches, patches], dim=0)
+                mask = torch.cat([mask, mask], dim=0)
+            cond_list_next = self.predict(patches, mask, cond_list)
+            mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
+            mask_len = torch.tensor([np.floor(self.seq_len * mask_ratio)], device=patches.device)
+
+            mask_len = torch.maximum(torch.tensor([1.], device=mask.device),
+                                     torch.minimum(torch.sum(mask, dim=-1, keepdim=True) - 1, mask_len))
+
+            mask_next = mask_by_order(mask_len[0], orders, bsz, self.seq_len)
+            mask_to_pred = mask[:bsz].bool() if step >= num_iter - 1 else torch.logical_xor(mask[:bsz].bool(), mask_next.bool())
+            mask = mask_next
+            if cfg != 1.0:
+                mask_to_pred = torch.cat([mask_to_pred, mask_to_pred], dim=0)
+
+            for i in range(len(cond_list_next)):
+                cond_list_next[i] = cond_list_next[i][mask_to_pred.nonzero(as_tuple=True)]
+
+            cfg_iter = 1 + (cfg - 1) * (self.seq_len - mask_len[0]) / self.seq_len if cfg_schedule == "linear" else cfg
+            sampled_patches = next_level_sample_function(cond_list_next, cfg=cfg_iter,
+                                                         temperature=temperature, filter_threshold=filter_threshold)
+            sampled_patches = sampled_patches.reshape(sampled_patches.size(0), -1)
+
+            if cfg != 1.0:
+                mask_to_pred, _ = mask_to_pred.chunk(2, dim=0)
+
+            cur_patches[mask_to_pred.nonzero(as_tuple=True)] = sampled_patches
+            patches = cur_patches.clone()
+
+        return self.unpatchify(patches)
+
+
