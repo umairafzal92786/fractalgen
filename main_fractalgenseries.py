@@ -67,7 +67,7 @@ class StockCSVFolderDataset(Dataset):
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Fractal Generative Models', add_help=False)
-    parser.add_argument('--batch_size', default=16, type=int,
+    parser.add_argument('--batch_size', default=1, type=int,
                         help='Batch size per GPU (effective batch size = batch_size * # GPUs)')
     parser.add_argument('--epochs', default=1, type=int)
     parser.add_argument('--seed', default=0, type=int)
@@ -82,7 +82,7 @@ def get_args_parser():
     parser.set_defaults(pin_mem=True)
 
     # Model parameters
-    parser.add_argument('--model', default='fractaltimeseriesar_in64', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='fractaltimeseriesmar_in64', type=str, metavar='MODEL',
                         help='Name of the model to train')
     parser.add_argument('--series_len', default=1024, type=int, help='series length')
 
@@ -131,8 +131,6 @@ def get_args_parser():
                         help='Epochs to warm up LR')
 
     # Fractal generator parameters
-    parser.add_argument('--guiding_pixel', action='store_true',
-                        help='Use guiding pixels')
     parser.add_argument('--num_conds', type=int, default=1,
                         help='Number of conditions to use')
     parser.add_argument('--grad_clip', type=float, default=3.0,
@@ -242,7 +240,6 @@ def main(args):
         class_num=args.class_num,
         attn_dropout=args.attn_dropout,
         proj_dropout=args.proj_dropout,
-        guiding_pixel=args.guiding_pixel,
         num_conds=args.num_conds,
         grad_checkpointing=args.grad_checkpointing
     )

@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from models.ar import ARTimeSeries
+from models.mar import MARTimeSeries
 from models.pixelloss import MultiVariateTimeStepLoss  # whichever fits best
 
 
@@ -22,7 +23,6 @@ class FractalGenTimeSeries(nn.Module):
         class_num=1000,
         attn_dropout=0.1,
         proj_dropout=0.1,
-        guiding_pixel=False,
         num_conds=1,
         grad_checkpointing=False,
         fractal_level=0,
@@ -48,8 +48,8 @@ class FractalGenTimeSeries(nn.Module):
         # Generator for the current level
         if generator_type_list[fractal_level] == "ar":
             generator = ARTimeSeries
-        # elif generator_type_list[fractal_level] == "mar":
-        #     generator = MAR
+        elif generator_type_list[fractal_level] == "mar":
+            generator = MARTimeSeries
         else:
             raise NotImplementedError
         self.generator = generator(
@@ -66,7 +66,6 @@ class FractalGenTimeSeries(nn.Module):
             num_heads=num_heads_list[fractal_level],
             attn_dropout=attn_dropout,
             proj_dropout=proj_dropout,
-            guiding_pixel=guiding_pixel if fractal_level > 0 else False,
             num_conds=num_conds,
             grad_checkpointing=grad_checkpointing,
         )
@@ -85,7 +84,6 @@ class FractalGenTimeSeries(nn.Module):
                 class_num=class_num,
                 attn_dropout=attn_dropout,
                 proj_dropout=proj_dropout,
-                guiding_pixel=guiding_pixel,
                 num_conds=num_conds,
                 grad_checkpointing=grad_checkpointing,
                 fractal_level=fractal_level + 1,
@@ -207,3 +205,19 @@ def fractaltimeseriesar_in64(**kwargs):
         **kwargs
     )
     return model
+
+def fractaltimeseriesmar_in64(**kwargs):
+    model = FractalGenTimeSeries(
+        series_size_list=(1024, 4, 1),
+        input_feat_dim=6,
+        embed_dim_list=(1024, 512, 128),
+        num_blocks_list=(32, 8, 3),
+        num_heads_list=(16, 8, 4),
+        generator_type_list=("mar", "mar", "ar"),
+        fractal_level=0,
+        **kwargs
+    )
+    return model
+
+# jiayu proposed using small at first level and bigger at middle levels then again small
+# update higher level after few steps and lower levels frequently

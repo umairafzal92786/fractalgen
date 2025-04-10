@@ -340,7 +340,8 @@ class MAR(nn.Module):
 
 class MARTimeSeries(nn.Module):
     def __init__(self, seq_len, patch_size, input_feat_dim, cond_embed_dim, embed_dim, num_blocks, num_heads,
-                 attn_dropout, proj_dropout, num_conds=1, grad_checkpointing=False):
+                 attn_dropout, proj_dropout, num_conds=1, 
+                 grad_checkpointing=False):
         super().__init__()
 
         self.seq_len = seq_len
