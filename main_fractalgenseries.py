@@ -14,7 +14,8 @@ from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 
 import util.misc as misc
-from engine_fractalgenseries import compute_nll, evaluate, train_one_epoch
+from engine_fractalgenseries import (compute_nll, evaluate, train_one_epoch,
+                                     validate)
 from models import fractalgentimeseries
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
@@ -87,7 +88,7 @@ def get_args_parser():
     parser.add_argument('--series_len', default=1024, type=int, help='series length')
 
     # Generation parameters
-    parser.add_argument('--num_iter_list', default='64,16', type=str,
+    parser.add_argument('--num_iter_list', default='1024,256', type=str,
                         help='Number of autoregressive iterations for each fractal level')
     parser.add_argument('--num_series', default=10, type=int,
                         help='Number of series to generate')
@@ -101,7 +102,7 @@ def get_args_parser():
     parser.add_argument('--label_drop_prob', default=0.1, type=float)
     parser.add_argument('--eval_freq', type=int, default=40,
                         help='Frequency (in epochs) for evaluation')
-    parser.add_argument('--save_last_freq', type=int, default=5,
+    parser.add_argument('--save_last_freq', type=int, default=10,
                         help='Frequency (in epochs) to save checkpoints')
     parser.add_argument('--online_eval', action='store_true')
     parser.add_argument('--evaluate_gen', action='store_true')
@@ -286,16 +287,16 @@ def main(args):
     else:
         print("Training from scratch")
 
-    # Evaluation modes
-    if args.evaluate_gen:
-        torch.cuda.empty_cache()
-        evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
-        return
+    # # Evaluation modes
+    # if args.evaluate_gen:
+    #     torch.cuda.empty_cache()
+    #     evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
+    #     return
 
-    if args.evaluate_nll:
-        torch.cuda.empty_cache()
-        compute_nll(model, data_loader_val, device, N=args.nll_forward_number)
-        return
+    # if args.evaluate_nll:
+    #     torch.cuda.empty_cache()
+    #     compute_nll(model, data_loader_val, device, N=args.nll_forward_number)
+    #     return
 
     # Training loop
     print(f"Start training for {args.epochs} epochs")
@@ -310,6 +311,11 @@ def main(args):
 
         # Save checkpoint periodically
         if epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs:
+
+            validate(
+                model_without_ddp, data_loader_val, device, epoch, log_writer=log_writer
+            )
+
             misc.save_model(
                 args=args,
                 model_without_ddp=model_without_ddp,
@@ -319,11 +325,11 @@ def main(args):
                 epoch_name="last"
             )
 
-        # Perform online evaluation at specified intervals
-        if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
-            torch.cuda.empty_cache()
-            evaluate(model_without_ddp, args, epoch, batch_size=args.gen_bsz, log_writer=log_writer)
-            torch.cuda.empty_cache()
+        # # Perform online evaluation at specified intervals
+        # if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
+        #     torch.cuda.empty_cache()
+        #     evaluate(model_without_ddp, args, epoch, batch_size=args.gen_bsz, log_writer=log_writer)
+        #     torch.cuda.empty_cache()
 
         if misc.is_main_process() and log_writer is not None:
             log_writer.flush()

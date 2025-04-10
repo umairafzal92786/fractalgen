@@ -72,6 +72,47 @@ def train_one_epoch(model, data_loader: Iterable, optimizer: torch.optim.Optimiz
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
+def validate(model, data_loader: Iterable, device: torch.device, epoch: int, log_writer=None):
+    model.eval()
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    header = 'Epoch: [{}]'.format(epoch)
+    print_freq = 20
+
+    with torch.no_grad():
+        for data_iter_step, (samples, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+            samples = samples.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            # forward
+            with torch.cuda.amp.autocast():
+                loss = model(samples, labels)
+
+            loss_value = loss.item()
+
+            if not math.isfinite(loss_value):
+                print("Loss is {}, stopping validation".format(loss_value))
+                sys.exit(1)
+
+            torch.cuda.synchronize()
+
+            metric_logger.update(loss=loss_value)
+            lr = 0.0  # No learning rate during validation
+            metric_logger.update(lr=lr)
+
+            loss_value_reduce = misc.all_reduce_mean(loss_value)
+            if log_writer is not None:
+                epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
+                log_writer.add_scalar('validation_loss', loss_value_reduce, epoch_1000x)
+                log_writer.add_scalar('lr', lr, epoch_1000x)
+
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger)
+
+    # Return the average validation loss
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+
 def compute_nll(model: torch.nn.Module, data_loader: Iterable, device: torch.device, N: int):
     model.eval()
     metric_logger = misc.MetricLogger(delimiter="  ")
