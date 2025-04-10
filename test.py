@@ -21,7 +21,7 @@ def main_img():
     imgs = torch.randn(2, 3, 16, 16).cuda()        # [B, C, H, W]
 
     # --- Dummy condition vector ---
-    cond_list = [torch.randn(2, 128).cuda(), torch.randn(2, 128).cuda()] 
+    cond_list = [torch.randn(2, 128).cuda()] 
 
     # --- Forward pass ---
     patches, cond_list_next, guiding_pixel_loss = mar_model(imgs, cond_list)

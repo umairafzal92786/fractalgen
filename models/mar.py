@@ -234,7 +234,6 @@ class MAR(nn.Module):
         """ training """
         # patchify to get gt
         patches = self.patchify(imgs)
-
         # mask tokens
         orders = self.sample_orders(bsz=patches.size(0))
         if self.training:
@@ -242,7 +241,6 @@ class MAR(nn.Module):
         else:
             # uniform random masking for NLL computation
             mask = self.random_masking_uniform(patches, orders)
-
         # guiding pixel
         if self.guiding_pixel:
             guiding_pixels = imgs.mean(-1).mean(-1)
@@ -258,11 +256,9 @@ class MAR(nn.Module):
         for cond_idx in range(len(cond_list_next)):
             cond_list_next[cond_idx] = cond_list_next[cond_idx].reshape(cond_list_next[cond_idx].size(0) * cond_list_next[cond_idx].size(1), -1)
             cond_list_next[cond_idx] = cond_list_next[cond_idx][mask.reshape(-1).bool()]
-
         patches = patches.reshape(patches.size(0) * patches.size(1), -1)
         patches = patches[mask.reshape(-1).bool()]
         patches = patches.reshape(patches.size(0), 3, self.patch_size, self.patch_size)
-
         return patches, cond_list_next, guiding_pixel_loss
 
     def sample(self, cond_list, num_iter, cfg, cfg_schedule, temperature, filter_threshold, next_level_sample_function,
@@ -442,9 +438,11 @@ class MARTimeSeries(nn.Module):
         return [cond_out]
 
     def forward(self, x, cond_list):
+
         patches = self.patchify(x)
         orders = self.sample_orders(patches.size(0))
         mask = self.random_masking(patches, orders) if self.training else self.random_masking_uniform(patches, orders)
+        
         cond_list_next = self.predict(patches, mask, cond_list)
         for cond_idx in range(len(cond_list_next)):
             cond_list_next[cond_idx] = cond_list_next[cond_idx].reshape(cond_list_next[cond_idx].size(0) * cond_list_next[cond_idx].size(1), -1)
@@ -463,7 +461,7 @@ class MARTimeSeries(nn.Module):
             bsz = cond_list[0].size(0) // 2
 
 
-        patches = torch.zeros(bsz, self.seq_len, self.patch_size * cond_list[0].size(-1) // self.num_conds).cuda()
+        patches = torch.zeros(bsz, self.seq_len, self.input_feat_dim * self.patch_size).cuda()
         mask = torch.ones(bsz, self.seq_len).cuda()
         orders = self.sample_orders(bsz)
         num_iter = min(self.seq_len, num_iter)
